@@ -1,11 +1,12 @@
 #include "HID-Project.h"
 
-// this is the raw HID report from the HE pedals
+// this is the raw HID report from the proxy
 typedef struct {
-  uint8_t id;
-  uint16_t throttle;
-  uint16_t brake;
-  uint16_t clutch;
+  //uint8_t id;
+  uint8_t throttle;
+  uint8_t brake;
+  uint8_t clutch;
+  uint8_t handbrake;
 } USBReport;
 
 USBReport report;
@@ -36,12 +37,14 @@ void loop() {
       // copy the data to the struct if we are within range
       if(i < sizeof(USBReport)) {
         report_ptr[i] = RawHID.read();
+      } else {
+         RawHID.read();
       }
     }
     Serial.print(pkt++);
     Serial.print(": ");
-    Serial.print(report.id);
-    Serial.print(" ");
+    //Serial.print(report.id);
+    //Serial.print(" ");
     Serial.print(report.throttle);
     Serial.print(" ");
     Serial.print(report.brake);
@@ -51,25 +54,30 @@ void loop() {
 
   if (Serial1.available() > 0)  {
     // wheelbase sent a request
-    int fb = Serial1.read();
+    int fb;
+
+    do {
+       fb = Serial1.read(); 
+    } while(Serial1.available() > 0);
 
     byte out = 0x80;
     // what did it ask for?
     switch(fb) {
-      case 0x80:
-        // clutch 0 - 4096
-        out = (report.clutch >> 5) | 0x80;
+      case 0x80: // brake?
+        out = report.clutch | 0x80;
         break;
       case 0xA0:
         // throttle 0 - 4096
-        out = (report.throttle >> 5) | 0x80;
+       out = report.throttle | 0x80;
         break;
       case 0xC0:
         // 
-        out = (report.brake >> 5) | 0x80;
+        out = report.brake | 0x80;
+        
         break;
       case 0xE0:
         // handbrake?
+        out = report.handbrake | 0x80;
         break;
       
     }
