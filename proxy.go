@@ -4,18 +4,12 @@ import (
 	"bytes"
 	"encoding/binary"
 	"flag"
-	"fmt"
 	"log"
+	"sync"
 
-	"github.com/karalabe/hid"
+	"github.com/sstallion/go-hid"
+	"go.bug.st/serial"
 )
-
-// VID: 1b4f, PID: 9208, Serial: C, Product: LilyPad USB, Interface: 2
-// VID: 2341, PID: 8036, Serial: C, Product: Arduino Leonardo, Interface: 2
-var proxyInfo = hid.DeviceInfo{
-	VendorID:  0x2341,
-	ProductID: 0x8036,
-}
 
 // VID: 30b7, PID: 1001, Serial: SP248E36055FEDC30D, Product: Heusinkveld Sim Pedals Sprint, Interface: 0
 var pedalInfo = hid.DeviceInfo{
@@ -23,14 +17,15 @@ var pedalInfo = hid.DeviceInfo{
 	ProductID: 0x1001,
 }
 
-type ProxyPedalReport struct {
-	Id        uint8
-	Throttle  uint8
-	Brake     uint8
-	Clutch    uint8
-	Handbrake uint8
+type ProxyPedal struct {
+	mutex    sync.Mutex
+	Throttle uint8
+	Brake    uint8
+	Clutch   uint8
+	Combined uint8
 }
 
+// HID report from HE pedals
 type HEPedalReport struct {
 	Id       uint8
 	Throttle uint16
@@ -38,66 +33,105 @@ type HEPedalReport struct {
 	Clutch   uint16
 }
 
-func main() {
+func fanatec_handler(port serial.Port, pp *ProxyPedal) {
 
-	enumerate := flag.Bool("enumerate", false, "enumerate devices")
-	flag.Parse()
-
-	if *enumerate {
-		ls()
-		return
-	}
-
-	fmt.Println("starting proxy")
-
-	fmt.Printf("Opening Pedal Device: %x:%x\n", pedalInfo.VendorID, pedalInfo.ProductID)
-	pedals, err := pedalInfo.Open()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer pedals.Close()
-
-	fmt.Printf("Opening Proxy Device: %x:%x\n", proxyInfo.VendorID, proxyInfo.ProductID)
-	proxy, err := proxyInfo.Open()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer proxy.Close()
-
-	buf := make([]byte, 256)
-	last_he := HEPedalReport{}
-
+	buff := make([]byte, 10)
+	out := make([]byte, 1)
 	for {
-		_, err := pedals.Read(buf)
+		n, err := port.Read(buff)
+		if err != nil {
+			log.Fatal("Failed to read serial port:", err)
+			break
+		}
+		cmd := buff[n-1] // get the last command asked for
+		out[0] = 0x80
+		pp.mutex.Lock()
+		switch cmd {
+		case 0x80:
+			out[0] = pp.Clutch | 0x80
+		case 0xA0:
+			out[0] = pp.Throttle | 0x80
+		case 0xC0:
+			out[0] = pp.Brake | 0x80
+		case 0xE0:
+			out[0] = pp.Combined | 0x80
+
+		}
+		pp.mutex.Unlock()
+
+		n, err = port.Write(out)
 		if err != nil {
 			log.Fatal(err)
 		}
+	}
+}
+
+func he_handler(pedals *hid.Device, pp *ProxyPedal) {
+	last_he := HEPedalReport{}
+
+	for {
+
+		rbuf := make([]byte, 64)
+		_, err := pedals.Read(rbuf)
+		if err != nil {
+			log.Fatal("Failed to read HID device: ", err)
+		}
 
 		he := HEPedalReport{}
-
-		rbufr := bytes.NewReader(buf)
-		err = binary.Read(rbufr, binary.LittleEndian, &he)
+		err = binary.Read(bytes.NewBuffer(rbuf), binary.LittleEndian, &he)
 		if err != nil {
-			fmt.Println("binary.Read failed:", err)
+			log.Fatal("binary.Read failed:", err)
 		}
 
 		if last_he == he {
 			continue
 		}
-		fmt.Printf("%v", he)
-		fmt.Println()
-	}
+		last_he = he
+		log.Printf("HE HID Report: %v", he)
 
+		pp.mutex.Lock()
+		// convert from HE values to 0 - 127
+		pp.Throttle = 127 - uint8(he.Throttle>>5)
+		pp.Brake = 127 - uint8(he.Brake>>5)
+		pp.Combined = 127 - uint8(he.Clutch>>5)
+		pp.mutex.Unlock()
+
+	}
 }
 
-func ls() {
-	devices := hid.Enumerate(0, 0)
-	for _, info := range devices {
-		fmt.Printf("%s: ID %04x:%04x %s %s\n",
-			info.Path,
-			info.VendorID,
-			info.ProductID,
-			info.Manufacturer,
-			info.Product)
+func main() {
+
+	flag.Parse()
+	args := flag.Args()
+	if len(args) < 1 {
+		log.Fatal("No serial port defined")
 	}
+
+	log.Println("starting proxy")
+	log.Printf("Opening Pedal Device: %x:%x\n", pedalInfo.VendorID, pedalInfo.ProductID)
+	pedals, err := hid.OpenFirst(pedalInfo.VendorID, pedalInfo.ProductID)
+	if err != nil {
+		log.Fatal("Failed to open HE Pedals HID:", err)
+	}
+	defer pedals.Close()
+
+	mode := &serial.Mode{
+		BaudRate: 230400,
+	}
+
+	comport := flag.Arg(0)
+	port, err := serial.Open(comport, mode)
+	if err != nil {
+		log.Fatal("Failed to open serial port: ", comport, " ", err)
+	}
+	defer port.Close()
+
+	// create the shared pedal report
+	pp := ProxyPedal{}
+
+	// start the wheelbase handler
+	go fanatec_handler(port, &pp)
+	// start the HE handler
+	he_handler(pedals, &pp)
+
 }

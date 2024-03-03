@@ -1,18 +1,19 @@
 # fanatec-pedal-emulator
 
-Small Arduino sketch and golang HID proxy
+Small golang HID to UART proxy
 
 Allows a set of USB pedals to be proxied to a Fanatec wheelbase and therefore
 be used on console if the wheelbase supports it
 
+# setup
+
+The Fanatec CSL Elite pedal control module uses a simple UART protocol to
+communicate with the wheelbase.  A 5v tolerant USB to RS232 TTL like the CP2102
+can be used to interface with the pedal RJ12 port on the wheelbase.
+
 # build/run proxy
 
-    go run proxy.go
-
-# build emulator
-
-1. install the HID-Project library
-
+    go run proxy.go [COMPORT]
 
 # microchip PIC
 
