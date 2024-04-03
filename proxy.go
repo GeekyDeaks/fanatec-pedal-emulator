@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"emu/fanatec"
 	"encoding/binary"
 	"flag"
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/sstallion/go-hid"
@@ -17,13 +20,7 @@ var pedalInfo = hid.DeviceInfo{
 	ProductID: 0x1001,
 }
 
-type ProxyPedal struct {
-	mutex    sync.Mutex
-	Throttle uint8
-	Brake    uint8
-	Clutch   uint8
-	Combined uint8
-}
+var mutex sync.Mutex
 
 // HID report from HE pedals
 type HEPedalReport struct {
@@ -33,40 +30,106 @@ type HEPedalReport struct {
 	Clutch   uint16
 }
 
-func fanatec_handler(port serial.Port, pp *ProxyPedal) {
-
-	buff := make([]byte, 10)
-	out := make([]byte, 1)
-	for {
-		n, err := port.Read(buff)
-		if err != nil {
-			log.Fatal("Failed to read serial port:", err)
-			break
-		}
-		cmd := buff[n-1] // get the last command asked for
-		out[0] = 0x80
-		pp.mutex.Lock()
-		switch cmd {
-		case 0x80:
-			out[0] = pp.Clutch | 0x80
-		case 0xA0:
-			out[0] = pp.Throttle | 0x80
-		case 0xC0:
-			out[0] = pp.Brake | 0x80
-		case 0xE0:
-			out[0] = pp.Combined | 0x80
-
-		}
-		pp.mutex.Unlock()
-
-		n, err = port.Write(out)
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
+type Step struct {
+	BaudRate int
+	Rx       []byte
+	Tx       []byte
 }
 
-func he_handler(pedals *hid.Device, pp *ProxyPedal) {
+type ProxyPedals struct {
+	fanatec.Pedals
+	mutex sync.Mutex
+}
+
+func dumpBytes(b []byte) string {
+	var sb strings.Builder
+	for i, b := range b {
+		if i > 0 {
+			sb.WriteString(" ")
+		}
+		sb.WriteString(fmt.Sprintf("%02x", b))
+	}
+	return sb.String()
+}
+
+func dumpStep(s Step) string {
+	// create a string buffer and append the Tx and Tx bytes to it
+	return fmt.Sprintf("Rx: [%s], Tx: [%s]", dumpBytes(s.Rx), dumpBytes(s.Tx))
+}
+
+func fanatec_handler(port serial.Port, pp *ProxyPedals) {
+
+	steps := []Step{
+		{BaudRate: 250000, Rx: []uint8{0x0a}, Tx: []uint8{0x1a}},
+		{BaudRate: 250000, Rx: []uint8{0x05}, Tx: []uint8{0x15}},
+		{
+			BaudRate: 115200,
+			Rx: []uint8{
+				0x7B, 0x02, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x26, 0x7D,
+				0x7B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAA, 0x7D,
+				0x7B, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5F, 0x7D,
+			},
+			Tx: []uint8{
+				0x7B, 0x05, 0x06, 0x62, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6D, 0x7D,
+				0x7B, 0x07, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x7D,
+				0x7B, 0x08, 0x01, 0x06, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x7D,
+			},
+		},
+	}
+
+	buff := make([]byte, 10)
+
+NEXT_STEP:
+	for stepNum := 0; stepNum < len(steps); {
+		step := steps[stepNum]
+		log.Printf("In step[%d]: %s\n", stepNum, dumpStep(step))
+		port.SetMode(&serial.Mode{BaudRate: step.BaudRate})
+		rxIdx := 0
+	NEXT_RX:
+		for {
+			n, err := port.Read(buff)
+			if err != nil {
+				log.Fatal("Failed to read serial port:", err)
+			}
+			// try and find the first rx byte or the next match
+			for i := 0; i < n && rxIdx < len(step.Rx); i++ {
+
+				if buff[i] != step.Rx[rxIdx] {
+					log.Printf("in step %d, expected [%s], got [%s]\n", stepNum, dumpBytes(step.Rx[rxIdx:]), dumpBytes(buff[i:n]))
+					if stepNum > 0 {
+						// reset the steps
+						stepNum = 0
+					}
+					rxIdx = 0
+					continue NEXT_STEP
+
+				} else {
+					log.Printf("in step %d, rxIdx: %d, found: [%s]", stepNum, rxIdx, dumpBytes(buff[i:n]))
+					rxIdx++
+					if rxIdx >= len(step.Rx) {
+						// got a complete match
+						break NEXT_RX
+					}
+				}
+
+			}
+		}
+		log.Printf("Step [%d], Got [%s], Sending: [%s]\n", stepNum, dumpBytes(step.Rx), dumpBytes(step.Tx))
+		port.Write(step.Tx)
+		stepNum++
+	}
+
+	// must have finished the steps, just keep sending the pedals now
+	for {
+		pp.mutex.Lock()
+		p := pp.CreatePacket()
+		pp.mutex.Unlock()
+		port.Write(p)
+	}
+
+}
+
+func he_handler(pedals *hid.Device, pp *ProxyPedals) {
 	last_he := HEPedalReport{}
 
 	for {
@@ -87,14 +150,15 @@ func he_handler(pedals *hid.Device, pp *ProxyPedal) {
 			continue
 		}
 		last_he = he
-		log.Printf("HE HID Report: %v", he)
 
 		pp.mutex.Lock()
-		// convert from HE values to 0 - 127
-		pp.Throttle = 127 - uint8(he.Throttle>>5)
-		pp.Brake = 127 - uint8(he.Brake>>5)
-		pp.Combined = 127 - uint8(he.Clutch>>5)
+		// convert from HE values to 0 - 65535
+		pp.Throttle = (he.Throttle << 4) + (he.Throttle >> 8)
+		pp.Brake = (he.Brake << 4) + (he.Brake >> 8)
+		pp.Clutch = (he.Clutch << 4) + (he.Clutch >> 8)
 		pp.mutex.Unlock()
+		log.Printf("HE HID Report: %4d / %4d / %4d, Proxy: %5d / %5d / %5d",
+			he.Throttle, he.Brake, he.Clutch, pp.Throttle, pp.Brake, pp.Clutch)
 
 	}
 }
@@ -116,7 +180,7 @@ func main() {
 	defer pedals.Close()
 
 	mode := &serial.Mode{
-		BaudRate: 230400,
+		BaudRate: 250000,
 	}
 
 	comport := flag.Arg(0)
@@ -127,7 +191,7 @@ func main() {
 	defer port.Close()
 
 	// create the shared pedal report
-	pp := ProxyPedal{}
+	pp := ProxyPedals{}
 
 	// start the wheelbase handler
 	go fanatec_handler(port, &pp)
