@@ -20,8 +20,6 @@ var pedalInfo = hid.DeviceInfo{
 	ProductID: 0x1001,
 }
 
-var mutex sync.Mutex
-
 // HID report from HE pedals
 type HEPedalReport struct {
 	Id       uint8
